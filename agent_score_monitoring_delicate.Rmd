@@ -1,0 +1,217 @@
+---
+title: "Sequential Agent-Risk Monitoring: Delicate Simulation"
+author: "AI Incident Sprint T1"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+    df_print: default
+---
+
+```{r setup, include=FALSE}
+required <- c("ggplot2", "dplyr", "tidyr", "patchwork", "ragg", "knitr")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse = ", "))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+  fig.width = 12, fig.height = 8, out.width = "100%", dpi = 150,
+  fig.path = "figs/.knitr_delicate/")
+source("synthetic_agent_score_generators.R")
+source("monitoring_report_helpers.R")
+cfg <- monitoring_config("delicate")
+dat <- prepare_monitoring_report(cfg)
+alarms <- summarize_monitor_alarms(dat, cfg)
+u <- dat[dat$scenario == "Unsafe", ]
+figures <- build_report_figures(dat, cfg, alarms)
+```
+
+# 1. Research question
+
+**Can changes in a trajectory-level risk assessment provide warning before a designated unsafe action?** A level threshold asks how concerning the trajectory looks now. An increment asks how much the assessment just changed. A rolling slope asks how rapidly it has been rising over several observations. These questions are related, but their answers need not agree.
+
+This is an ongoing research prototype. All event labels and scores below are **constructed synthetic illustrations**: we do not run a classifier on actual agent logs, fit an empirical process, or demonstrate a validated safety system. The examples make the monitoring calculations inspectable.
+
+For an observed event \(X_t\), let \(H_t=(X_1,\ldots,X_t)\). In a future application, an upstream scorer would produce \(S_t=f(H_t)\). Here we construct a sequence with that intended prefix-level interpretation, then examine its dynamics.
+
+This delicate version examines ambiguity: weak precursors, temporary reversals, an unsafe-action jump, and high-score saturation. It can be read independently of the simple version.
+
+# 2. Simulation design and settings
+
+The unsafe sequence has 34 steps: a noisy low baseline at steps 1–8, non-monotone weak precursors at steps 9–16, escalation with reversals at steps 17–24, a jump phase at steps 25–27, and high-score saturation at steps 28–34. The largest designed jump coincides with the designated unsafe action at step 27; detecting that jump alone therefore provides no advance warning. A further high-risk event at step 30 illustrates a high local score with a small prefix update. The safe comparison has benign spikes at steps 7, 14, 22, and 29; the step-7 spike is part of initialization.
+
+This is a stylized, empirically motivated design, not an empirically fitted or validated model. No public trajectory supplies the numerical values used here.
+
+Both scenarios contain noise, and the safe trajectory includes unusual but benign events. The unsafe-action label is supplied by the simulation design; it is not inferred from a high score or a monitor alarm. Phase names describe the synthetic construction, not detected change points.
+
+```{r configuration}
+knitr::kable(configuration_table(cfg, dat), align = c("l", "l"),
+  caption = "Reproducible settings used in this report")
+```
+
+The shared `monitoring_config()` function defines report settings and records the generators' fixed phase boundaries. Change phase shapes in `synthetic_agent_score_generators.R` and update their descriptive metadata together. Other report settings can be changed in the configuration before preparing the data.
+
+**Initialization is not prospective monitoring.** Steps 1–8 estimate a separate baseline mean for each trajectory. From step 9 onward, each baseline is frozen. CUSUM starts from zero at that boundary; its initialization values are shown as unavailable. Other features use their observed history, but no detector may alarm during initialization. This explicitly assumes the first eight observations are suitable baseline data; contaminated initialization would compromise the comparison.
+
+```{r fig-prefix, fig.cap="Prefix risk: escalation can begin before a fixed level threshold fires."}
+export_report_figure(figures$prefix_risk, cfg, 1, "prefix_risk")
+figures$prefix_risk
+```
+
+The ring marks the first eligible level crossing, rather than the start of escalation. The safe panel shows why a useful comparison needs more than a flat low-risk control. Event annotations are illustrative context, not evidence of a causal relationship between an event label and a score change.
+
+# 3. Three distinct quantities
+
+| Quantity | Definition | Question |
+|:--|:--|:--|
+| Local score | \(L_t=g(X_t)\) | How concerning is the current event itself? |
+| Prefix score | \(S_t=f(H_t)\) | How concerning is the observable history so far? |
+| Increment | \(\Delta S_t=S_t-S_{t-1}\) | How much did the newest observation update that assessment? |
+
+The increment is **context-dependent and model-dependent**. It is not an intrinsic or causal contribution of \(X_t\). A high local score can accompany either a large update or a small update when the history already looks concerning. The first increment is undefined because the example supplies no \(S_0\).
+
+```{r fig-quantities, fig.height=10, fig.cap="Aligned panels separate current-event suspicion, history-level assessment, and the newest update."}
+export_report_figure(figures$score_distinctions, cfg, 2, "score_distinctions", height = 10)
+figures$score_distinctions
+```
+
+At the unsafe action (step 27), the local score is `r sprintf("%.2f", u$local_score[u$t == 27])` and the prefix increment is `r sprintf("%.3f", u$increment[u$t == 27])`. At step 30, the local score remains high at `r sprintf("%.2f", u$local_score[u$t == 30])`, while the increment is only `r sprintf("%.3f", u$increment[u$t == 30])`. The already-high prefix score helps illustrate why **a small increment does not imply a benign event**. These values are deliberately constructed, not a measured decomposition of risk.
+
+# 4. From updates to monitoring signals
+
+## Increment versus rolling momentum
+
+At step \(t\), the rolling OLS slope fits
+
+\[
+S_i=a_t+\beta_t i+\varepsilon_i,\qquad i=t-w+1,\ldots,t,
+\]
+
+using only the latest \(w=5\) observed scores. The result has units of **score change per step**. It is unavailable until five observations exist. An increment describes one update; the slope summarizes several updates and is not a separate event classifier. A single large jump can influence the next several slope estimates, so a positive slope alone does not establish a sustained regime change.
+
+```{r fig-momentum, fig.cap="Signed increments and trailing slopes respond differently to benign spikes and designed escalation."}
+export_report_figure(figures$increment_momentum, cfg, 3, "increment_momentum")
+figures$increment_momentum
+```
+
+## Level, smoothing, and accumulation
+
+We compare four illustrative rules. Their different thresholds do **not** imply matched false-alarm rates.
+
+| Monitor | Statistic and interpretation | Alarm rule |
+|:--|:--|:--|
+| Level | Current prefix assessment \(S_t\) | \(S_t\geq 0.70\) |
+| Momentum | Trailing OLS slope \(\hat\beta_t\) | \(\hat\beta_t\geq 0.045\) |
+| EWMA | Smoothed prefix score \(Z_t\) | \(Z_t\geq 0.60\) |
+| CUSUM | Accumulated positive deviation \(C_t\) | \(C_t\geq 1.20\) |
+
+EWMA follows
+
+\[
+Z_1=S_1,\qquad Z_t=\lambda S_t+(1-\lambda)Z_{t-1}.
+\]
+
+It reduces short-term variation and introduces lag. It is a view of recent trajectory level, not an automatic route to earlier warnings.
+
+For CUSUM, let \(\hat\mu_0=\frac18\sum_{t=1}^8S_t\). With \(C_8=0\),
+
+\[
+C_t=\max\{0,C_{t-1}+S_t-\hat\mu_0-k\},\qquad t\geq9.
+\]
+
+A score above \(\hat\mu_0+k\) increases the statistic; lower scores reduce it, down to zero. Its scale is accumulated score deviation, not probability or a calibrated evidence ratio. Relative to the original demo, the report deliberately removes retrospective CUSUM accumulation within the initialization window.
+
+```{r fig-monitors, fig.cap="Monitor panels retain their own units and display the exact thresholds used for alarms."}
+export_report_figure(figures$monitor_signals, cfg, 4, "monitor_signals")
+figures$monitor_signals
+```
+
+# 5. Alarm timing and advance warning
+
+For statistic \(M_t\) with cutoff \(h\), the first eligible alarm is
+
+\[
+T_A=\min\{t>8:M_t\geq h\}.
+\]
+
+If no eligible crossing exists, the result is **No alarm**, not a zero or an alarm at the last step. Let \(T^\star\) denote the designated unsafe-action step. Then
+
+\[
+\text{lead time}=T^\star-T_A.
+\]
+
+Positive lead time means an early alarm, zero means an alarm at the action, and a negative value means a late alarm. Safe trajectories have no designated unsafe action, so their lead time is undefined. These are observed-step counts: operational usefulness also depends on scoring latency and intervention time.
+
+```{r alarm-table}
+alarm_table <- alarms[, c("scenario", "detector", "cutoff", "alarm_time", "unsafe_time", "lead_steps", "status")]
+names(alarm_table) <- c("Scenario", "Monitor", "Cutoff", "First alarm", "Unsafe step", "Lead steps", "Outcome")
+knitr::kable(alarm_table, row.names = FALSE, caption = "First eligible alarm for each monitor and scenario; NA means undefined or absent.")
+```
+
+```{r fig-timing, fig.height=6, fig.cap="Compare first alarms with the unsafe action and inspect safe-trajectory alarm status alongside them."}
+export_report_figure(figures$alarm_timing, cfg, 5, "alarm_timing", height = 6)
+figures$alarm_timing
+```
+
+```{r result-text, echo=FALSE, results='asis'}
+a <- alarms[alarms$scenario == "Unsafe", ]
+for (i in seq_len(nrow(a))) {
+  timing <- if (is.na(a$alarm_time[i])) "does not alarm" else sprintf("alarms at step %d (%s; lead time %d steps)",
+    a$alarm_time[i], tolower(a$status[i]), a$lead_steps[i])
+  cat(sprintf("- **%s** %s.\n", a$detector[i], timing))
+}
+ns <- sum(!is.na(alarms$alarm_time[alarms$scenario == "Safe"]))
+cat(sprintf("\nIn this safe trajectory, **%d of four monitors alarm** during the eligible window. This is a single-trajectory outcome, not a false-alarm-rate estimate.\n", ns))
+```
+
+The illustration shows how temporal summaries can react before a high level cutoff. It does not establish that these rules outperform a lower level threshold: that comparison requires calibration at comparable false-alarm rates and held-out trajectories. **Early warning is a question about useful precursor information, not simply about choosing a smaller score cutoff.**
+
+# 6. Limitations and transition to real trajectories
+
+**Overlapping prefixes create dependence.** Each score summarizes a history containing the previous history. Classical independent-observation false-alarm interpretations for control charts do not automatically apply.
+
+**Temporal aggregation may reuse history.** EWMA and CUSUM aggregate scores that already summarize history. Whether this extracts useful dynamics or partly double-counts information remains a research question.
+
+**Scores are not established probabilities.** Neither their calibration nor their relationship to actual unsafe outcomes has been validated here. Probability-scale or log-odds analysis is a future extension; no log-odds plot is presented for these arbitrary scores.
+
+**Synthetic separability is designed.** The unsafe sequence has escalation and the safe sequence has transient spikes by construction. One pair cannot establish recall, false-alarm rates, or lead-time distributions. Threshold calibration on safe trajectories and evaluation on held-out safe/unsafe traces are future work. Formal change detection is also future work; the present slope and CUSUM curves are not estimated change points.
+
+A real-data workflow would replay observable prefixes through a fixed scorer, save the resulting scores, and reuse the numeric monitoring functions. Keep local scores optional and distinguish observed events from reconstructed or inferred ones.
+
+```{r real-schema, eval=FALSE}
+# One ordered trajectory per call; local_score is optional for monitoring.
+real_trajectory <- data.frame(
+  trajectory_id = "trace_001", scenario = "unlabeled", t = seq_along(prefix_scores),
+  event = observed_event_labels, risk_score = prefix_scores,
+  unsafe_event = designated_unsafe_flags
+)
+features <- add_monitoring_features(real_trajectory,
+  slope_window = cfg$slope_window, ewma_lambda = cfg$ewma_lambda,
+  cusum_baseline = mean(prefix_scores[1:cfg$baseline_n]), cusum_k = cfg$cusum_k)
+# For the report's initialization convention, replace CUSUM with a
+# post-initialization recurrence, as in prepare_monitoring_report().
+active <- seq.int(cfg$baseline_n + 1L, nrow(features))
+features$cusum <- NA_real_
+features$cusum[active] <- cusum_upper(prefix_scores[active],
+  baseline = mean(prefix_scores[1:cfg$baseline_n]), k = cfg$cusum_k)
+# First-alarm eligibility is t > cfg$baseline_n, using only available scores.
+```
+
+The immediate next experiment is to score one real observable trajectory and inspect whether its temporal structure resembles this illustration. Multiple labeled trajectories are needed before making performance claims.
+
+# Background and empirical motivation
+
+[SHADE-Arena](https://www.anthropic.com/research/shade-arena-sabotage-monitoring) studies transcript-based suspicion monitoring in sabotage evaluations. [ControlArena's monitor documentation](https://control-arena.aisi.org.uk/monitors.html) describes step-level monitoring that produces suspicion scores. These motivate the monitoring setting; neither source supplies or validates the numerical trajectories constructed here. Transcript-level monitoring also does not by itself establish that a dataset contains the prefix-by-prefix scores required for this experiment.
+
+# Figure files and companion report
+
+Each figure above is exported from the same plot object to a 300-dpi PNG and a vector PDF in `figs/`. Filenames begin with `delicate_01_` through `delicate_05_`; rendering this report does not overwrite the other version's exports.
+
+```{r figure-links, echo=FALSE, results='asis'}
+slugs <- c("prefix_risk", "score_distinctions", "increment_momentum", "monitor_signals", "alarm_timing")
+for (i in seq_along(slugs)) {
+  stem <- sprintf("figs/%s_%02d_%s", cfg$design, i, slugs[i])
+  cat(sprintf("- Figure %d: [PNG](%s.png) · [PDF](%s.pdf)\n", i, stem, stem))
+}
+```
+
+See the [simple simulation report](agent_score_monitoring_simple.html) for the companion illustration, or return to the [report guide](agent_score_monitoring_demo.html).
